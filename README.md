@@ -2,6 +2,12 @@
 
 Interactive **4×4 matrix transform bench** for glTF models, built with Three.js — a revival of an old Bell Labs demo.
 
+## RUN DEMO
+
+**[▶ Run the demo at sandyressler.com/matrix](https://sandyressler.com/matrix)**
+
+![Matrix Transform Bench screenshot](images/screenshot.png)
+
 Three views side by side:
 
 1. **Input model** — the original `.glb`
