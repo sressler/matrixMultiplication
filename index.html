@@ -1,0 +1,652 @@
+<title>Matrix Transform Bench</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@500;600;700&display=swap">
+<style>
+/* Layout: one-screen lab bench — three viewports (input × matrix = output) over a WebGL control console */
+:root{
+  --bg:#eef0f2; --panel:#f9fafb; --ink:#14202e; --muted:#5b6876; --rule:#cdd3da;
+  --pos:#d9601a; --neg:#1f7f9e; --accent:#d9601a; --scene:#e4e8ec; --grid:#b9c1ca;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0f141a; --panel:#161d25; --ink:#e3e8ee; --muted:#8c99a7; --rule:#2a3440;
+  --pos:#f0803c; --neg:#4cb3d4; --accent:#f0803c; --scene:#121920; --grid:#2c3742; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0f141a; --panel:#161d25; --ink:#e3e8ee; --muted:#8c99a7; --rule:#2a3440;
+  --pos:#f0803c; --neg:#4cb3d4; --accent:#f0803c; --scene:#121920; --grid:#2c3742; color-scheme:dark}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;overflow:hidden;background:var(--bg);color:var(--ink);font-family:"IBM Plex Mono",ui-monospace,monospace;
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:12px}
+#app{position:relative;width:100%;height:100%}
+#c{position:absolute;inset:0;width:100%;height:100%;display:block;outline:none;touch-action:none}
+.ov{position:absolute;touch-action:none}
+#drop{position:absolute;inset:0;z-index:6;border:2px dashed var(--accent);border-radius:4px;display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb,var(--bg) 80%,transparent);font-weight:600;pointer-events:none;z-index:5}
+#drop[hidden]{display:none}
+#file{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+</style>
+
+<div id="app">
+  <canvas id="c" tabindex="0" aria-label="Matrix transform bench: input model, 4 by 4 matrix bar plot, transformed model, and 16 matrix sliders"></canvas>
+  <div class="ov" id="ovIn"></div>
+  <div class="ov" id="ovM"></div>
+  <div class="ov" id="ovOut"></div>
+  <div id="drop" hidden>Drop .glb here to load it as the input model</div>
+</div>
+<input type="file" id="file" accept=".glb,.gltf,model/gltf-binary" tabindex="-1" aria-hidden="true">
+
+<script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const FM = '"IBM Plex Mono", ui-monospace, Menlo, monospace';
+const FD = '"IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif';
+const clamp = (v,a,b) => Math.min(b,Math.max(a,v));
+const fmt = v => { const x = Math.abs(v)<5e-4?0:v; return (x<0?'':' ')+x.toFixed(2); };
+const SUB = ['₁','₂','₃','₄'];
+const VMIN = -3, VMAX = 3;
+
+/* ================= state ================= */
+const M = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+const spin = {x:true,y:false,z:true}; let speed = 45, speedS = null, dragSpeed = false; const SPMAX = 180;
+let sel = 0, typing = null, statusMsg = '', fileLabel = 'Duck (loading…)', modelStats = '';
+
+/* ================= renderer + views ================= */
+const app = $('app'), canvas = $('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+renderer.autoClear = false; renderer.outputColorSpace = THREE.SRGBColorSpace;
+let W = 1, H = 1, DPR = 1, L = null;
+
+function makeView(el, camPos){
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(40,1,0.05,200);
+  camera.position.copy(camPos);
+  const controls = new OrbitControls(camera, el);
+  controls.enableDamping = !reduce;
+  scene.add(new THREE.HemisphereLight(0xffffff,0x667788,1.4));
+  const d = new THREE.DirectionalLight(0xffffff,1.6); d.position.set(4,8,5); scene.add(d);
+  return {el, scene, camera, controls, rect:{x:0,y:0,w:1,h:1}};
+}
+const vIn  = makeView($('ovIn'),  new THREE.Vector3(3.2,2.6,4.2));
+const vM   = makeView($('ovM'),   new THREE.Vector3(5.0,9.4,8.8));
+const vOut = makeView($('ovOut'), new THREE.Vector3(4.5,3.6,5.8));
+const views = [vIn, vM, vOut];
+
+const grids = [];
+function addGrid(scene,size,div){ const g = new THREE.GridHelper(size,div); g.position.y=-0.001; scene.add(g); grids.push(g); }
+addGrid(vIn.scene,8,16); addGrid(vOut.scene,12,24);
+vIn.scene.add(new THREE.AxesHelper(1.6));
+const boundsBox = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(2,2,2)), new THREE.LineBasicMaterial({transparent:true,opacity:.5}));
+vOut.scene.add(boundsBox);
+const xf = new THREE.Group(); xf.matrixAutoUpdate = false; vOut.scene.add(xf);
+xf.add(new THREE.AxesHelper(1.6));
+
+/* ================= models ================= */
+let inHolder = new THREE.Group(), outHolder = new THREE.Group();
+vIn.scene.add(inHolder); xf.add(outHolder);
+
+function sampleModel(){
+  const g = new THREE.Group();
+  const ink = new THREE.MeshStandardMaterial({color:0x3a5a80,roughness:.55,metalness:.1});
+  const hot = new THREE.MeshStandardMaterial({color:0xd9601a,roughness:.5});
+  const pale = new THREE.MeshStandardMaterial({color:0xc9d2dc,roughness:.7});
+  const box = (w,h,d,x,y,z,m)=>{const b=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),m); b.position.set(x,y,z); g.add(b);};
+  box(.5,3,.5, 0,1.5,0, ink); box(1.8,.5,.5, .65,2.75,0, ink); box(1.2,.5,.5, .35,1.6,0, ink);
+  box(2.2,.15,1.4, .5,.075,0, pale);
+  const s = new THREE.Mesh(new THREE.SphereGeometry(.28,32,16), hot); s.position.set(1.55,2.75,0); g.add(s);
+  const c = new THREE.Mesh(new THREE.ConeGeometry(.22,.6,24), hot); c.rotation.z=-Math.PI/2; c.position.set(1.25,1.6,0); g.add(c);
+  return g;
+}
+function normalize(obj){
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3()), ctr = box.getCenter(new THREE.Vector3());
+  const k = 2/Math.max(size.x,size.y,size.z,1e-6);
+  const wrap = new THREE.Group(); obj.position.sub(ctr); wrap.add(obj); wrap.scale.setScalar(k);
+  return wrap;
+}
+function setModel(obj,label){
+  inHolder.parent.remove(inHolder); outHolder.parent.remove(outHolder);
+  const norm = normalize(obj);
+  inHolder = norm; vIn.scene.add(inHolder);
+  outHolder = SkeletonUtils.clone(norm); xf.add(outHolder);
+  let tris=0, meshes=0;
+  obj.traverse(o=>{ if(o.isMesh){ meshes++; const gm=o.geometry; tris += (gm.index?gm.index.count:gm.attributes.position.count)/3; if(o.material) o.material.side = THREE.DoubleSide; } });
+  modelStats = `${meshes} mesh · ${Math.round(tris).toLocaleString()} tri`;
+  fileLabel = label; statusMsg = '';
+  refreshHUD();
+}
+const loader = new GLTFLoader(); loader.setMeshoptDecoder(MeshoptDecoder);
+function loadFile(file){
+  if(!file) return;
+  const r = new FileReader();
+  r.onload = () => loader.parse(r.result,'',gltf=>setModel(gltf.scene,file.name),e=>{
+    statusMsg = `Couldn’t read ${file.name}. Use a self-contained .glb (no Draco).`; refreshHUD();
+  });
+  r.readAsArrayBuffer(file);
+}
+$('file').addEventListener('change',e=>{ loadFile(e.target.files[0]); e.target.value=''; });
+const dropEl = $('drop');
+const hasFiles = e => [...(e.dataTransfer?.types||[])].includes('Files');
+let dragDepth = 0;
+addEventListener('dragenter',e=>{ if(!hasFiles(e)) return; e.preventDefault(); dragDepth++; dropEl.hidden=false; });
+addEventListener('dragover',e=>{ if(!hasFiles(e)) return; e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
+addEventListener('dragleave',e=>{ if(!hasFiles(e)) return; if(--dragDepth<=0){ dragDepth=0; dropEl.hidden=true; } });
+addEventListener('drop',e=>{ e.preventDefault(); dragDepth=0; dropEl.hidden=true;
+  const f=[...(e.dataTransfer?.files||[])].find(f=>/\.(glb|gltf)$/i.test(f.name)) || e.dataTransfer?.files?.[0];
+  if(f){ if(pickerOpen) setPicker(false); loadFile(f); } });
+
+/* ================= matrix bar plot (3D) ================= */
+const SP = 1.25, BAR_K = 0.7;
+const plate = new THREE.Mesh(new THREE.BoxGeometry(SP*4+.3,.08,SP*4+.3), new THREE.MeshStandardMaterial({roughness:.9,transparent:true,opacity:.45,depthWrite:false}));
+plate.position.y = -0.06; vM.scene.add(plate);
+const barGeo = new THREE.BoxGeometry(.62,1,.62); barGeo.translate(0,.5,0);
+const tileGeo = new THREE.BoxGeometry(1,.04,1);
+const posMat = new THREE.MeshStandardMaterial({roughness:.45}), negMat = new THREE.MeshStandardMaterial({roughness:.45});
+const tileMat = new THREE.MeshStandardMaterial({roughness:.8,transparent:true,opacity:.7,depthWrite:false}), tileHot = new THREE.MeshStandardMaterial({roughness:.8,transparent:true,opacity:.85,depthWrite:false});
+const tiles=[], bars=[], labels=[], axisSprites=[];
+
+function spriteCanvas(w,h){
+  const c = document.createElement('canvas'); c.width=w; c.height=h;
+  const tex = new THREE.CanvasTexture(c); tex.colorSpace = THREE.SRGBColorSpace;
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({map:tex,depthTest:false,transparent:true}));
+  s.renderOrder = 10; s.userData.c = c; return s;
+}
+for(let r=0;r<4;r++) for(let c=0;c<4;c++){
+  const x=(c-1.5)*SP, z=(r-1.5)*SP;
+  const t = new THREE.Mesh(tileGeo,tileMat); t.position.set(x,0,z); t.userData.i=r*4+c; vM.scene.add(t); tiles.push(t);
+  const b = new THREE.Mesh(barGeo,posMat); b.position.set(x,.02,z); b.userData.i=r*4+c; vM.scene.add(b); bars.push(b);
+  const l = spriteCanvas(256,96); l.scale.set(.78,.29,1); vM.scene.add(l); labels.push(l);
+}
+for(let i=0;i<4;i++){
+  const a = spriteCanvas(256,96); a.scale.set(.75,.28,1); a.position.set((i-1.5)*SP,.05,-2.5*SP+.25); a.userData.t='c'+(i+1); vM.scene.add(a); axisSprites.push(a);
+  const b = spriteCanvas(256,96); b.scale.set(.75,.28,1); b.position.set(-2.5*SP+.25,.05,(i-1.5)*SP); b.userData.t='r'+(i+1); vM.scene.add(b); axisSprites.push(b);
+}
+function drawValueSprite(s,text,color){
+  const c=s.userData.c, x=c.getContext('2d'); x.clearRect(0,0,c.width,c.height);
+  x.globalAlpha=.88; x.fillStyle=css('--panel'); x.beginPath(); x.roundRect(14,14,228,68,10); x.fill(); x.globalAlpha=1;
+  x.font=`600 46px ${FM}`; x.textAlign='center'; x.textBaseline='middle'; x.fillStyle=color; x.fillText(text.trim(),128,50);
+  s.material.map.needsUpdate=true;
+}
+function drawAxisSprites(){
+  axisSprites.forEach(s=>{ const c=s.userData.c,x=c.getContext('2d'); x.clearRect(0,0,c.width,c.height);
+    x.font=`500 40px ${FM}`; x.textAlign='center'; x.textBaseline='middle'; x.fillStyle=css('--muted'); x.fillText(s.userData.t,128,48);
+    s.material.map.needsUpdate=true; });
+}
+function updateBars(){
+  for(let i=0;i<16;i++){
+    const v=M[i], b=bars[i], h=Math.max(Math.abs(v)*BAR_K,.002);
+    b.scale.y=h; b.rotation.x = v<0?Math.PI:0; b.position.y = v<0?0:.02; b.material = v<0?negMat:posMat; b.visible = Math.abs(v)>=5e-4;
+    labels[i].position.set(b.position.x,(v<0?0:h)+.32,b.position.z);
+    drawValueSprite(labels[i],fmt(v),v<0?css('--neg'):css('--ink'));
+    tiles[i].material = i===sel?tileHot:tileMat;
+  }
+}
+
+/* ================= HUD toolkit (three.js orthographic overlay) ================= */
+const hud = new THREE.Scene();
+const hudCam = new THREE.OrthographicCamera(0,1,0,-1,-10,10);
+const unit = new THREE.PlaneGeometry(1,1); unit.translate(.5,-.5,0);
+const disc = new THREE.CircleGeometry(1,28);
+const mctx = document.createElement('canvas').getContext('2d');
+let order = 0, hits = [], C = {};
+const measure = (s,size,wt=400,fam=FM) => { mctx.font=`${wt} ${size}px ${fam}`; return mctx.measureText(s).width; };
+const mat = color => new THREE.MeshBasicMaterial({color:new THREE.Color(color),transparent:true,depthTest:false,depthWrite:false});
+
+function addRect(x,y,w,h,color,opacity=1){
+  const m = new THREE.Mesh(unit,mat(color)); m.material.opacity=opacity;
+  m.position.set(x,-y,0); m.scale.set(Math.max(w,0.0001),Math.max(h,0.0001),1); m.renderOrder=order++; hud.add(m); return m;
+}
+function addFrame(x,y,w,h,color){ addRect(x,y,w,1,color); addRect(x,y+h-1,w,1,color); addRect(x,y,1,h,color); addRect(x+w-1,y,1,h,color); }
+function addDisc(x,y,r,color){ const m=new THREE.Mesh(disc,mat(color)); m.position.set(x,-y,0); m.scale.set(r,r,1); m.renderOrder=order++; hud.add(m); return m; }
+function addText(str,x,y,o={}){
+  const cv=document.createElement('canvas'), ctx=cv.getContext('2d');
+  const tex=new THREE.CanvasTexture(cv); tex.colorSpace=THREE.SRGBColorSpace; tex.generateMipmaps=false; tex.minFilter=THREE.LinearFilter;
+  const m=new THREE.Mesh(unit,new THREE.MeshBasicMaterial({map:tex,transparent:true,depthTest:false,depthWrite:false}));
+  m.renderOrder=order++; hud.add(m);
+  const size=o.size||12, wt=o.weight||400, fam=o.font==='display'?FD:FM, align=o.align||'left';
+  m.set=(s,color=o.color)=>{
+    if(s===m._s && color===m._c) return; m._s=s; m._c=color;
+    const f=`${wt} ${size*DPR}px ${fam}`; ctx.font=f; ctx.letterSpacing = o.track?`${o.track*DPR}px`:'0px';
+    const tw=Math.max(2,Math.ceil(ctx.measureText(s).width+4*DPR)), th=Math.ceil(size*1.4*DPR);
+    if(cv.width!==tw||cv.height!==th){ cv.width=tw; cv.height=th; tex.dispose(); }
+    ctx.clearRect(0,0,tw,th); ctx.font=f; ctx.textBaseline='middle'; ctx.fillStyle=color;
+    ctx.letterSpacing = o.track?`${o.track*DPR}px`:'0px';
+    ctx.fillText(s,2*DPR,th/2+size*.06*DPR); tex.needsUpdate=true;
+    const w=tw/DPR, h=th/DPR; m.scale.set(w,h,1);
+    const ax = align==='center'? x-w/2 : align==='right'? x-w+2 : x-2;
+    m.position.set(ax, -(o.vcenter? y-h/2 : y), 0);
+  };
+  m.set(str); return m;
+}
+function clearHUD(){
+  hud.traverse(o=>{ if(o.material){ o.material.map?.dispose(); o.material.dispose(); } });
+  hud.clear(); hits=[]; order=0; hoverBtn=null;
+}
+
+/* ================= layout ================= */
+function layout(){
+  W = Math.max(1,app.clientWidth); H = Math.max(1,app.clientHeight); DPR = Math.min(devicePixelRatio||1,2);
+  renderer.setPixelRatio(DPR); renderer.setSize(W,H,false);
+  const G = 10; L = {narrow: W < 760, G};
+  if(!L.narrow){
+    const hudH = clamp(H*0.36, 236, 310), vh = H-hudH-G, opW = 26, u = (W-2*opW)/3.2;
+    vIn.rect  = {x:0, y:0, w:u, h:vh};
+    vM.rect   = {x:u+opW, y:0, w:u*1.2, h:vh};
+    vOut.rect = {x:u*2.2+opW*2, y:0, w:W-(u*2.2+opW*2), h:vh};
+    L.ops = [{x:u+opW/2, y:vh/2, t:'×'}, {x:u*2.2+opW*1.5, y:vh/2, t:'='}];
+    const hy = vh+G, pw = clamp(W*0.2, 250, 310), rw = clamp(W*0.22, 250, 330);
+    L.presets = {x:0, y:hy, w:pw, h:hudH};
+    L.grid    = {x:pw+G, y:hy, w:W-pw-rw-2*G, h:hudH};
+    L.read    = {x:W-rw, y:hy, w:rw, h:hudH};
+  } else {
+    const r1 = Math.round(H*0.24), r2 = Math.round(H*0.2);
+    vIn.rect  = {x:0, y:0, w:(W-G)/2, h:r1};
+    vOut.rect = {x:(W+G)/2, y:0, w:(W-G)/2, h:r1};
+    vM.rect   = {x:0, y:r1+G, w:W, h:r2};
+    L.ops = [];
+    const hy = r1+r2+2*G, rest = H-hy;
+    L.presets = {x:0, y:hy, w:W, h:null};          // height decided by button flow
+    L.read    = {x:0, y:H-58, w:W, h:58};
+    L.gridBottom = H-58-G;
+  }
+  for(const v of views){
+    const r=v.rect; Object.assign(v.el.style,{left:r.x+'px',top:r.y+'px',width:r.w+'px',height:r.h+'px'});
+    v.camera.aspect = r.w/r.h; v.camera.updateProjectionMatrix();
+  }
+  Object.assign(dropEl.style,{left:vIn.rect.x+'px',top:vIn.rect.y+'px',width:vIn.rect.w+'px',height:vIn.rect.h+'px',right:'auto',bottom:'auto'});
+  hudCam.left=0; hudCam.right=W; hudCam.top=0; hudCam.bottom=-H; hudCam.updateProjectionMatrix();
+}
+
+/* ================= HUD build ================= */
+let sliders=[], T={};
+const PRESETS = [
+  ['Identity',   [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]],
+  ['Rot Z 45°',  (()=>{const c=Math.cos(Math.PI/4),s=Math.sin(Math.PI/4);return [c,-s,0,0, s,c,0,0, 0,0,1,0, 0,0,0,1];})()],
+  ['Rot Y 30°',  (()=>{const c=Math.cos(Math.PI/6),s=Math.sin(Math.PI/6);return [c,0,s,0, 0,1,0,0, -s,0,c,0, 0,0,0,1];})()],
+  ['Scale',      [1.5,0,0,0, 0,.5,0,0, 0,0,1,0, 0,0,0,1]],
+  ['Shear XY',   [1,.8,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]],
+  ['Mirror X',   [-1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]],
+  ['Translate',  [1,0,0,1.5, 0,1,0,.5, 0,0,1,-1, 0,0,0,1]],
+  ['Flatten Z',  [1,0,0,0, 0,1,0,0, 0,0,0,0, 0,0,0,1]],
+  ['Projective', [1,0,0,0, 0,1,0,0, 0,0,1,0, .25,0,0,1]],
+];
+
+function readColors(){
+  C = {bg:css('--bg'),panel:css('--panel'),ink:css('--ink'),muted:css('--muted'),rule:css('--rule'),pos:css('--pos'),neg:css('--neg'),accent:css('--accent'),scene:css('--scene'),grid:css('--grid')};
+  C.tint = '#'+new THREE.Color(C.accent).lerp(new THREE.Color(C.panel),.8).getHexString();
+  C.btnHover = '#'+new THREE.Color(C.accent).lerp(new THREE.Color(C.panel),.88).getHexString();
+}
+
+function button(label,x,y,action,primary){
+  const fs=11, w=Math.ceil(measure(label,fs,500))+18, h=24;
+  const bg = addRect(x,y,w,h, primary?C.ink:C.panel);
+  addFrame(x,y,w,h, primary?C.ink:C.rule);
+  addText(label,x+w/2,y+h/2,{size:fs,weight:500,align:'center',vcenter:true,color:primary?C.bg:C.ink});
+  hits.push({type:'btn',x,y,w,h,action,bg,base:primary?C.ink:C.panel,hover:primary?C.accent:C.btnHover});
+  return w;
+}
+function flow(items,box,y0){ // lay buttons left→right, wrapping
+  let x=box.x+12, y=y0; const gap=6;
+  for(const [label,act,primary] of items){
+    const w = Math.ceil(measure(label,11,500))+18;
+    if(x+w>box.x+box.w-12 && x>box.x+12){ x=box.x+12; y+=24+gap; }
+    button(label,x,y,act,primary); x+=w+gap;
+  }
+  return y+24;
+}
+function toggle(label,x,y,key){
+  const on=spin[key], w=34, h=24;
+  const bg=addRect(x,y,w,h,on?C.accent:C.panel); addFrame(x,y,w,h,on?C.accent:C.rule);
+  addText(label,x+w/2,y+h/2,{size:11,weight:600,align:'center',vcenter:true,color:on?C.bg:C.ink});
+  hits.push({type:'btn',x,y,w,h,bg,base:on?C.accent:C.panel,hover:on?C.accent:C.btnHover,
+    action:()=>{ spin[key]=!spin[key]; if(spin[key]) cancelAnimationFrame(tw); buildHUD(); }});
+}
+function speedSlider(x,y,w){
+  addText('speed',x,y,{size:10,color:C.muted});
+  const val=addText('',x+w,y,{size:11,weight:600,align:'right',color:C.ink});
+  const tx=x+6, tw=w-12, ty=y+24;
+  for(let k=0;k<=4;k++) addRect(tx+k/4*tw-.5,ty+3,1,4,C.muted,.45);
+  addRect(tx,ty-1.5,tw,3,C.rule);
+  const fill=addRect(tx,ty-1.5,1,3,C.accent);
+  const knob=addDisc(tx,ty,6.5,C.ink), kin=addDisc(tx,ty,3,C.panel);
+  speedS={tx,tw,ty,val,fill,knob,kin};
+  hits.push({type:'speed',x,y,w,h:32});
+}
+function rotRow(x,y,w){ // X Y Z toggles + speed slider
+  toggle('X',x,y+4,'x'); toggle('Y',x+40,y+4,'y'); toggle('Z',x+80,y+4,'z');
+  speedSlider(x+128,y,w-128);
+}
+function setSpeed(px){ speed=Math.round(clamp((px-speedS.tx)/speedS.tw,0,1)*SPMAX); refreshSpeed(); }
+function refreshSpeed(){
+  if(!speedS) return; const s=speedS, px=s.tx+speed/SPMAX*s.tw;
+  s.fill.scale.x=Math.max(px-s.tx,.0001); s.knob.position.x=px; s.kin.position.x=px; s.val.set(`${speed}°/s`);
+}
+
+function buildHUD(){
+  readColors(); clearHUD();
+  // view frames, titles, hints
+  const titles = [[vIn,'INPUT MODEL','drop a .glb here · drag to orbit'],[vM,'MATRIX  M','bar height = value · click a bar to select'],[vOut,'RESULT  M · p','grey box = original bounds · axes = M basis']];
+  for(const [v,t,hint] of titles){
+    const r=v.rect; addFrame(r.x,r.y,r.w,r.h,C.rule);
+    addText(t,r.x+12,r.y+9,{size:12,weight:600,font:'display',color:C.ink,track:1.2});
+    if(r.w>260) addText(hint,r.x+12,r.y+r.h-22,{size:10,color:C.muted});
+  }
+  T.stats = addText(modelStats, vIn.rect.x+vIn.rect.w-12, vIn.rect.y+10, {size:10,color:C.muted,align:'right'});
+  T.stats.visible = vIn.rect.w > 300;
+  T.det = addText('', vM.rect.x+vM.rect.w-12, vM.rect.y+10, {size:10,color:C.muted,align:'right'});
+  for(const op of L.ops) addText(op.t,op.x,op.y,{size:22,font:'display',weight:500,align:'center',vcenter:true,color:C.muted});
+
+  // presets panel
+  const P = L.presets;
+  const items1 = [['Load .glb',openFile,true],['Khronos samples',()=>setPicker(!pickerOpen),true],['Curious George',loadGeorge]];
+  const items2 = PRESETS.map(([n,m])=>[n,()=>tweenTo(m)]);
+  if(!L.narrow){
+    addRect(P.x,P.y,P.w,P.h,C.panel); addFrame(P.x,P.y,P.w,P.h,C.rule);
+    addText('MODEL',P.x+12,P.y+10,{size:11,weight:600,font:'display',color:C.muted,track:1.2});
+    let y = flow(items1,P,P.y+30);
+    addText('PRESETS',P.x+12,y+14,{size:11,weight:600,font:'display',color:C.muted,track:1.2});
+    flow(items2,P,y+34);
+  } else {
+    // measure flow height first by a dry run
+    const box={x:P.x,w:P.w}; let y=P.y+10;
+    addRect(P.x,P.y,P.w,1,C.rule);
+    y = flow([...items1,...items2],box,y);
+    rotRow(P.x+12,y+8,P.w-24);
+    P.h = y+8+34-P.y+6;
+    L.grid = {x:0, y:P.y+P.h+4, w:W, h:L.gridBottom-(P.y+P.h+4)};
+  }
+
+  // slider grid
+  const g = L.grid;
+  addRect(g.x,g.y,g.w,g.h,C.panel); addFrame(g.x,g.y,g.w,g.h,C.rule);
+  const rowW = 26, head = 22, pad = 8;
+  const cw = (g.w-rowW-pad*2-3*6)/4, ch = (g.h-head-pad*2-3*6)/4;
+  const colNames = ['c1 · x','c2 · y','c3 · z','c4 · t'];
+  for(let c=0;c<4;c++) addText(colNames[c], g.x+pad+rowW+c*(cw+6)+cw/2, g.y+pad+head/2-2, {size:10,color:C.muted,align:'center',vcenter:true});
+  sliders=[];
+  for(let r=0;r<4;r++){
+    const cy = g.y+pad+head+r*(ch+6);
+    addText('r'+(r+1), g.x+pad+rowW/2, cy+ch/2, {size:10,color:C.muted,align:'center',vcenter:true});
+    for(let c=0;c<4;c++){
+      const i=r*4+c, cx=g.x+pad+rowW+c*(cw+6);
+      const bg = addRect(cx,cy,cw,ch,C.bg); addFrame(cx,cy,cw,ch,C.rule);
+      const lblSize = ch>40?11:10;
+      addText(`m${SUB[r]}${SUB[c]}`, cx+8, cy+5, {size:lblSize,color:C.muted});
+      const val = addText(fmt(M[i]), cx+cw-8, cy+4, {size:ch>40?13:11,weight:600,align:'right',color:C.ink});
+      const tx = cx+12, tw = cw-24, ty = cy+ch-Math.min(13,ch*.3);
+      // ticks at integers
+      for(let k=VMIN;k<=VMAX;k++){ const px=tx+(k-VMIN)/(VMAX-VMIN)*tw; addRect(px-.5,ty+(k===0?-6:3),1,k===0?12:4,C.muted,k===0?.8:.45); }
+      addRect(tx,ty-1.5,tw,3,C.rule);
+      const fill = addRect(tx,ty-1.5,1,3,C.pos);
+      const knob = addDisc(tx,ty,6.5,C.ink);
+      const knobIn = addDisc(tx,ty,3,C.panel);
+      sliders.push({i,cx,cy,cw,ch,tx,tw,ty,bg,val,fill,knob,knobIn});
+      hits.push({type:'slider',i,x:cx,y:cy,w:cw,h:ch});
+    }
+  }
+
+  // readout
+  const R = L.read;
+  addRect(R.x,R.y,R.w,R.h,C.panel); addFrame(R.x,R.y,R.w,R.h,C.rule);
+  if(!L.narrow){
+    addText('Matrix Transform Bench',R.x+14,R.y+10,{size:17,weight:700,font:'display',color:C.ink});
+    addText('p′ = M · p  (homogeneous coords)',R.x+14,R.y+34,{size:10,color:C.muted});
+    addText('ANIMATE ROTATION',R.x+14,R.y+56,{size:11,weight:600,font:'display',color:C.accent,track:1.2});
+    rotRow(R.x+14,R.y+74,R.w-28);
+    T.detL  = addText('',R.x+14,R.y+118,{size:12,color:C.ink});
+    T.typeL = addText('',R.x+14,R.y+136,{size:12,color:C.ink});
+    T.note  = addText('',R.x+14,R.y+156,{size:11,color:C.accent});
+    T.file  = addText('',R.x+14,R.y+176,{size:10,color:C.muted});
+    const help = ['drag · wheel · type value + Enter','← → nudge · ↑ ↓ cell · dbl-click reset','snaps to −1, 0, 1 (Shift skips)'];
+    help.forEach((h,k)=>{ const y=R.y+198+k*14; if(y<R.y+R.h-14) addText(h,R.x+14,y,{size:10,color:C.muted}); });
+  } else {
+    T.detL  = addText('',R.x+12,R.y+8,{size:11,color:C.ink});
+    T.typeL = addText('',R.x+R.w-12,R.y+8,{size:11,color:C.ink,align:'right'});
+    T.note  = addText('',R.x+12,R.y+24,{size:10,color:C.accent});
+    T.file  = addText('',R.x+12,R.y+40,{size:10,color:C.muted});
+  }
+  if(pickerOpen) buildPicker();
+  refreshHUD(); refreshSpeed();
+}
+
+function sliderValueFromX(s,px,raw){
+  let v = VMIN + clamp((px-s.tx)/s.tw,0,1)*(VMAX-VMIN);
+  v = Math.round(v*100)/100;
+  if(!raw) for(const t of [-1,0,1]) if(Math.abs(v-t)<0.06) v=t;
+  return v;
+}
+function refreshHUD(){
+  if(!sliders.length) return;
+  for(const s of sliders){
+    const v=M[s.i], zx=s.tx+(0-VMIN)/(VMAX-VMIN)*s.tw, px=s.tx+(clamp(v,VMIN,VMAX)-VMIN)/(VMAX-VMIN)*s.tw;
+    s.fill.position.x=Math.min(px,zx); s.fill.scale.x=Math.max(Math.abs(px-zx),.0001);
+    s.fill.material.color.set(v<0?C.neg:C.pos);
+    s.knob.position.x=px; s.knobIn.position.x=px;
+    const isSel = s.i===sel;
+    s.knob.material.color.set(isSel?C.accent:C.ink);
+    s.bg.material.color.set(isSel?C.tint:C.bg);
+    const txt = isSel && typing!==null ? typing+'▌' : fmt(v);
+    s.val.set(txt, isSel&&typing!==null?C.accent: v<0?C.neg: v>0?C.pos:C.ink);
+  }
+  const det = xf.matrix.determinant();
+  const affine = Math.abs(M[12])+Math.abs(M[13])+Math.abs(M[14])<1e-9 && Math.abs(M[15]-1)<1e-9;
+  T.det.set(`det ${det.toFixed(3)}`);
+  T.stats.set(modelStats);
+  T.detL.set(`det M = ${det.toFixed(4)}`);
+  T.typeL.set(`type: ${affine?'affine':'projective'}`);
+  T.note.set(statusMsg || (Math.abs(det)<1e-6?'singular: model collapses flat': det<0?'det < 0: orientation flips (mirror)':' '), statusMsg?C.neg:C.accent);
+  const fl=`model: ${fileLabel}`, maxc=Math.floor((L.read.w-28)/6.1);
+  T.file.set(fl.length>maxc? fl.slice(0,maxc-1)+'…' : fl);
+}
+
+/* ================= apply ================= */
+function apply(){
+  xf.matrix.set(...M); xf.matrixWorldNeedsUpdate = true;
+  updateBars(); refreshHUD();
+}
+function setVal(i,v){ M[i]=v; apply(); }
+function setAll(arr){ arr.forEach((v,i)=>M[i]=v); apply(); }
+let tw=null;
+function tweenTo(target){
+  cancelAnimationFrame(tw);
+  if(reduce){ setAll(target.slice()); return; }
+  const from=M.slice(), t0=performance.now(), dur=550;
+  const step=now=>{ let t=Math.min((now-t0)/dur,1); t=t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+    setAll(from.map((f,i)=>f+(target[i]-f)*t)); if(t<1) tw=requestAnimationFrame(step); };
+  tw=requestAnimationFrame(step);
+}
+/* ================= Khronos sample assets (bundled from KhronosGroup/glTF-Sample-Assets) ================= */
+const KH = [
+  ['Duck','Duck','SCEA Shared Source','Sony',0.12],
+  ['Fox','Fox','CC0 / CC-BY 4.0','PixelMannen, tomkranis',0.16],
+  ['CesiumMilkTruck','Cesium Milk Truck','CC-BY 4.0','Cesium',0.37],
+  ['CesiumMan','Cesium Man','CC-BY 4.0','Cesium',0.44],
+  ['ChairDamaskPurplegold','Damask Chair','CC-BY 4.0','Eric Chadwick',2.0],
+  ['DamagedHelmet','Damaged Helmet','CC-BY / CC-BY-NC 4.0','ctxwing, theblueturtle_',3.8],
+  ['SheenChair','Sheen Chair','CC0','Eric Chadwick',4.1],
+  ['IridescenceLamp','Iridescence Lamp','CC-BY 4.0','Eric Chadwick',4.1],
+  ['ToyCar','Toy Car','CC0','Eric Chadwick, Guido Odendahl',5.4],
+  ['Avocado','Avocado','CC0','Microsoft',8.1],
+];
+let pickerOpen = false;
+function setPicker(open){ pickerOpen=open; views.forEach(v=>v.el.style.pointerEvents=open?'none':''); buildHUD(); }
+async function fetchGlbTxt(path){
+  // Prefer the real .glb next to the page; fall back to the base64 .glb.txt copy (used where .glb can't be hosted)
+  try{ const g = await fetch(path.replace(/\.txt$/,'')); if(g.ok){ const buf = await g.arrayBuffer(); if(new TextDecoder().decode(new Uint8Array(buf,0,4))==='glTF') return buf; } }catch(e){}
+  const r = await fetch(path); if(!r.ok) throw new Error(r.status);
+  const bin = atob((await r.text()).trim()), u8 = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) u8[i]=bin.charCodeAt(i);
+  return u8.buffer;
+}
+const GEORGE_LABEL = 'Curious George, 1970s plush · scan by sressler · CC-BY-NC 4.0';
+let georgeBuf = null;
+async function loadGeorge(){
+  if(pickerOpen) setPicker(false);
+  statusMsg = 'Loading Curious George (9.6 MB)…'; refreshHUD();
+  try{
+    georgeBuf = georgeBuf || await fetchGlbTxt('models/george.glb.txt');
+    loader.parse(georgeBuf.slice(0),'',g=>setModel(g.scene,GEORGE_LABEL),()=>{ statusMsg='Couldn’t parse the Curious George model.'; refreshHUD(); });
+  }catch(e){
+    if(!inHolder.children.length || modelStats.startsWith('0 mesh')) setModel(sampleModel(),'Fallback: block “F”');
+    statusMsg = 'Couldn’t fetch the Curious George model.'; refreshHUD();
+  }
+}
+async function loadKhronos(k){
+  setPicker(false); statusMsg=`Loading ${k[1]} (${k[4]} MB)…`; refreshHUD();
+  try{
+    const buf = await fetchGlbTxt(`models/khronos/${k[0]}.glb.txt`);
+    loader.parse(buf,'',g=>setModel(g.scene,`Khronos ${k[1]} · ${k[2]} · ${k[3]}`),()=>{ statusMsg=`Couldn’t parse ${k[1]}.`; refreshHUD(); });
+  }catch(e){
+    if(modelStats.startsWith('0 mesh')) setModel(sampleModel(),'Fallback: block “F”');
+    statusMsg=`Couldn’t fetch ${k[1]}.`; refreshHUD();
+  }
+}
+function buildPicker(){
+  const a=vIn.rect, b=vM.rect;
+  const x=a.x+6, y=a.y+6, w=(b.x+b.w)-x-6, h=(L.narrow? b.y+b.h : a.h)-12;
+  addRect(x,y,w,h,C.panel,.97); addFrame(x,y,w,h,C.accent);
+  addText('KHRONOS glTF SAMPLE ASSETS',x+14,y+12,{size:12,weight:600,font:'display',color:C.ink,track:1.2});
+  addText('KhronosGroup/glTF-Sample-Assets · license per model',x+14,y+31,{size:10,color:C.muted});
+  const cw=28, cx=x+w-cw-8, cy=y+8;
+  const cbg=addRect(cx,cy,cw,24,C.panel); addFrame(cx,cy,cw,24,C.rule);
+  addText('×',cx+cw/2,cy+12,{size:15,align:'center',vcenter:true,color:C.ink});
+  hits.push({type:'btn',x:cx,y:cy,w:cw,h:24,bg:cbg,base:C.panel,hover:C.btnHover,action:()=>setPicker(false)});
+  const top=y+54, rowH=40, gap=6, avail=h-(top-y)-10;
+  const rows=Math.max(1,Math.floor((avail+gap)/(rowH+gap)));
+  const cols=Math.max(Math.ceil(KH.length/rows), w>640?2:1);
+  const perCol=Math.ceil(KH.length/cols), colW=(w-28-(cols-1)*8)/cols;
+  KH.forEach((k,n)=>{
+    const c=Math.floor(n/perCol), r=n%perCol, bx=x+14+c*(colW+8), by=top+r*(rowH+gap);
+    const bg=addRect(bx,by,colW,rowH,C.bg); addFrame(bx,by,colW,rowH,C.rule);
+    addText(k[1],bx+10,by+5,{size:12,weight:600,color:C.ink});
+    if(colW>300){
+      addText(`${k[4]} MB`,bx+colW-10,by+6,{size:10,color:C.muted,align:'right'});
+      addText(`${k[2]} · ${k[3]}`,bx+10,by+22,{size:10,color:C.muted});
+    } else addText(`${k[4]} MB · ${k[2]}`,bx+10,by+22,{size:10,color:C.muted});
+    hits.push({type:'btn',x:bx,y:by,w:colW,h:rowH,bg,base:C.bg,hover:C.btnHover,action:()=>loadKhronos(k)});
+  });
+}
+function select(i){ if(typing!==null) typing=null; sel=((i%16)+16)%16; updateBars(); refreshHUD(); }
+function openFile(){ $('file').click(); }
+
+/* ================= HUD input ================= */
+const pt = e => { const b=canvas.getBoundingClientRect(); return {x:e.clientX-b.left, y:e.clientY-b.top}; };
+const hitAt = p => { for(let k=hits.length-1;k>=0;k--){ const h=hits[k]; if(p.x>=h.x&&p.x<=h.x+h.w&&p.y>=h.y&&p.y<=h.y+h.h) return h; } return null; };
+let drag=null, press=null, hoverBtn=null;
+canvas.addEventListener('pointerdown',e=>{
+  canvas.focus({preventScroll:true});
+  const p=pt(e), h=hitAt(p); if(!h) return;
+  if(h.type==='slider'){
+    cancelAnimationFrame(tw); select(h.i);
+    const s=sliders[h.i];
+    if(p.y > s.cy + s.ch*0.45){ drag=s; canvas.setPointerCapture(e.pointerId); setVal(s.i,sliderValueFromX(s,p.x,e.shiftKey)); }
+  } else if(h.type==='btn'){ press=h; }
+  else if(h.type==='speed'){ dragSpeed=true; canvas.setPointerCapture(e.pointerId); setSpeed(p.x); }
+});
+canvas.addEventListener('pointermove',e=>{
+  const p=pt(e);
+  if(drag){ setVal(drag.i,sliderValueFromX(drag,p.x,e.shiftKey)); return; }
+  if(dragSpeed){ setSpeed(p.x); return; }
+  const h=hitAt(p);
+  canvas.style.cursor = h ? (h.type==='speed' ? 'ew-resize' : h.type==='slider' && p.y>sliders[h.i].cy+sliders[h.i].ch*.45 ? 'ew-resize':'pointer') : 'default';
+  const nb = h&&h.type==='btn'?h:null;
+  if(nb!==hoverBtn){ if(hoverBtn) hoverBtn.bg.material.color.set(hoverBtn.base); if(nb) nb.bg.material.color.set(nb.hover); hoverBtn=nb; }
+});
+canvas.addEventListener('pointerup',e=>{
+  if(drag||dragSpeed){ drag=null; dragSpeed=false; canvas.releasePointerCapture(e.pointerId); }
+  if(press){ const h=hitAt(pt(e)); if(h===press) press.action(); press=null; }
+});
+canvas.addEventListener('pointerleave',()=>{ if(hoverBtn){ hoverBtn.bg.material.color.set(hoverBtn.base); hoverBtn=null; } });
+canvas.addEventListener('dblclick',e=>{ const h=hitAt(pt(e)); if(h&&h.type==='slider'){ const r=Math.floor(h.i/4),c=h.i%4; setVal(h.i,r===c?1:0); } });
+canvas.addEventListener('wheel',e=>{
+  const h=hitAt(pt(e)); if(!h||h.type!=='slider') return;
+  e.preventDefault(); cancelAnimationFrame(tw); if(sel!==h.i) select(h.i);
+  const step=e.shiftKey?0.01:0.05; setVal(h.i, Math.round((M[h.i]-Math.sign(e.deltaY)*step)*100)/100);
+},{passive:false});
+addEventListener('keydown',e=>{
+  if(e.target && e.target.tagName==='INPUT') return;
+  const k=e.key;
+  if(/^[0-9.]$/.test(k) || (k==='-' && (typing===null||typing===''))){ typing=(typing??'')+k; refreshHUD(); e.preventDefault(); }
+  else if(k==='Backspace' && typing!==null){ typing=typing.slice(0,-1); refreshHUD(); e.preventDefault(); }
+  else if(k==='Enter' && typing!==null){ const v=parseFloat(typing); typing=null; if(isFinite(v)) setVal(sel,v); else refreshHUD(); e.preventDefault(); }
+  else if(k==='Escape'){ typing=null; if(pickerOpen) setPicker(false); else refreshHUD(); }
+  else if(k==='ArrowLeft'||k==='ArrowRight'){ cancelAnimationFrame(tw); typing=null; const d=(e.shiftKey?0.1:0.01)*(k==='ArrowLeft'?-1:1); setVal(sel,Math.round((M[sel]+d)*100)/100); e.preventDefault(); }
+  else if(k==='ArrowUp'){ select(sel-4); e.preventDefault(); }
+  else if(k==='ArrowDown'){ select(sel+4); e.preventDefault(); }
+  else if(k==='Tab'){ select(sel+(e.shiftKey?-1:1)); e.preventDefault(); }
+});
+
+// click a bar/tile in the matrix view to select its slider
+const ray = new THREE.Raycaster(); let downAt=null;
+vM.el.addEventListener('pointerdown',e=>{ downAt={x:e.clientX,y:e.clientY}; });
+vM.el.addEventListener('pointerup',e=>{
+  if(!downAt||Math.hypot(e.clientX-downAt.x,e.clientY-downAt.y)>5) return;
+  const b=vM.el.getBoundingClientRect();
+  ray.setFromCamera(new THREE.Vector2((e.clientX-b.left)/b.width*2-1, -((e.clientY-b.top)/b.height)*2+1), vM.camera);
+  const hit=ray.intersectObjects([...bars,...tiles],false)[0];
+  if(hit) { select(hit.object.userData.i); canvas.focus({preventScroll:true}); }
+});
+
+/* ================= theme ================= */
+function applyTheme(){
+  readColors();
+  const bg=new THREE.Color(C.scene), gc=new THREE.Color(C.grid);
+  views.forEach(v=>v.scene.background=bg);
+  grids.forEach(g=>{ g.material.vertexColors=false; g.material.color=gc; g.material.needsUpdate=true; });
+  boundsBox.material.color.set(C.muted);
+  posMat.color.set(C.pos); negMat.color.set(C.neg);
+  tileMat.color.set(C.panel); tileHot.color.set(C.accent).lerp(new THREE.Color(C.panel),.5);
+  plate.material.color.set(C.rule);
+  drawAxisSprites(); buildHUD(); updateBars();
+}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',applyTheme);
+new MutationObserver(applyTheme).observe(document.documentElement,{attributes:true,attributeFilter:['data-theme']});
+
+/* ================= boot ================= */
+new ResizeObserver(()=>{ layout(); buildHUD(); }).observe(app);
+layout();
+setModel(new THREE.Group(),'Duck (loading…)');
+M.splice(0,16, 0.87,-0.5,0,0.4, 0.5,0.87,0.35,0.3, 0,0,1,0, 0,0,0,1);   // open in a visible working state
+xf.matrix.set(...M);
+applyTheme(); apply();
+loadKhronos(KH[0]);   // default model: Khronos Duck
+document.fonts?.ready.then(()=>{ buildHUD(); updateBars(); drawAxisSprites(); });
+
+const bgCol = new THREE.Color(), clock = new THREE.Clock(), mA = new THREE.Matrix4(), mR = new THREE.Matrix4();
+(function loop(){
+  requestAnimationFrame(loop);
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if((spin.x||spin.y||spin.z) && speed>0){
+    const a = speed*dt*Math.PI/180;
+    mA.set(...M);
+    if(spin.x) mA.premultiply(mR.makeRotationX(a));
+    if(spin.y) mA.premultiply(mR.makeRotationY(a));
+    if(spin.z) mA.premultiply(mR.makeRotationZ(a));
+    const e = mA.elements; for(let r=0;r<4;r++) for(let c=0;c<4;c++) M[r*4+c]=e[c*4+r];
+    apply();
+  }
+  bgCol.set(C.bg||'#eef0f2');
+  renderer.setScissorTest(false); renderer.setViewport(0,0,W,H); renderer.setClearColor(bgCol,1); renderer.clear();
+  renderer.setScissorTest(true);
+  for(const v of views){
+    const r=v.rect, y=H-r.y-r.h;
+    renderer.setViewport(r.x,y,r.w,r.h); renderer.setScissor(r.x,y,r.w,r.h);
+    v.controls.update(); renderer.render(v.scene,v.camera);
+  }
+  renderer.setScissorTest(false); renderer.setViewport(0,0,W,H); renderer.clearDepth();
+  renderer.render(hud,hudCam);
+})();
+</script>
